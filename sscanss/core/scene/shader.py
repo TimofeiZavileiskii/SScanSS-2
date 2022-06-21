@@ -148,9 +148,10 @@ uniform vec2 viewport_size;
 uniform vec3 top;
 uniform vec3 bottom;
 uniform float step_length;
-
+uniform bool clip_top;
 uniform sampler3D volume;
 uniform sampler1D transfer_func;
+uniform sampler2D render_texture;
 
 uniform float gamma;
 
@@ -211,7 +212,8 @@ void main()
 
     ray_start += step_vector;
     vec3 position = ray_start;
-    vec4 colour = vec4(0.0);
+    // 
+    vec4 colour = vec4(0.0);//texture2D(render_texture, gl_FragCoord.xy / viewport_size);
 
     if (num_of_steps > 10000)
     {
@@ -219,20 +221,45 @@ void main()
         step_vector = ray / num_of_steps;
     }
 
+    
     // Ray march until reaching the end of the volume, or colour saturation
     for (int i = 0; i < num_of_steps; i++)
-    {  
+    {
+
         float intensity = texture3D(volume, position).r;
         vec4 c = texture1D(transfer_func, intensity);
         if (highlight)
             c = vec4(gl_Color.rgb, c.a) * intensity;
-
+        
+        if (clip_top){
+            if (position.z > 0.95 && c.a > 0.0f)
+            {
+                //num_of_steps = 0;
+                //c.a = 0.0f;
+                //discard;
+                //colour = vec4(1, 0, 0, 0);
+                //break;
+            }
+        }
+        else
+        {
+            if (position.z < 0.05 && c.a > 0.0f)
+            {
+                //colour = vec4(1, 0, 0, 0);
+                //break;
+                //num_of_steps = 0;
+                //c.a = 0.0f;
+                //discard;
+            }
+        }
+        
         // Alpha-blending
         colour.rgb += (1.0 - colour.a) * c.a * c.rgb;
         colour.a += (1.0 - colour.a) * c.a;
 
         position += step_vector;
-
+        
+  
         if (colour.a > .97)
         {
             colour.a = 1.0;
@@ -381,30 +408,40 @@ class Texture3D:
     :param data:  3D array of volume
     :type data: numpy.ndarray
     """
-    def __init__(self, data):
-        width, height, depth = data.shape
+    def __init__(self, data, blocks):
 
+        self.data = data
+        self.blocks = blocks
+        self.pbo = []
+        self.texture = []
         try:
-            self.pbo = GL.glGenBuffers(1)
-            self.texture = GL.glGenTextures(1)
-            # map and modify pixel buffer
-            GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.pbo)
-            GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, data.nbytes, None, GL.GL_STATIC_DRAW)
-            mapped_buffer = GL.glMapBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_WRITE_ONLY)
-            ctypes.memmove(mapped_buffer, data.transpose().ctypes.data, data.nbytes)
-            GL.glUnmapBuffer(GL.GL_PIXEL_UNPACK_BUFFER)
+            for block in blocks:
+                self.pbo.append(GL.glGenBuffers(1))
+                self.texture.append(GL.glGenTextures(1))
+                # map and modify pixel buffer
+                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.pbo[-1])
+                tmp = data[block.start[0]:block.stop[0], block.start[1]:block.stop[1], block.start[2]:block.stop[2]]
+                GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, tmp.nbytes, None, GL.GL_DYNAMIC_DRAW)
+                mapped_buffer = GL.glMapBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_WRITE_ONLY)
+                ctypes.memmove(mapped_buffer, tmp.ctypes.data, tmp.nbytes)
+                GL.glUnmapBuffer(GL.GL_PIXEL_UNPACK_BUFFER)
 
-            self.texture = GL.glGenTextures(1)
-            GL.glBindTexture(GL.GL_TEXTURE_3D, self.texture)
+            self.block_shape = blocks[-1].shape
+            GL.glBindTexture(GL.GL_TEXTURE_3D, self.texture[-1])
             GL.glTexParameteri(GL.GL_TEXTURE_3D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
             GL.glTexParameteri(GL.GL_TEXTURE_3D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
             GL.glTexParameteri(GL.GL_TEXTURE_3D, GL.GL_TEXTURE_WRAP_R, GL.GL_CLAMP_TO_EDGE)
             GL.glTexParameteri(GL.GL_TEXTURE_3D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
             GL.glTexParameteri(GL.GL_TEXTURE_3D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
             GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)  # The array on the host has 1 byte alignment
-            GL.glTexImage3D(GL.GL_TEXTURE_3D, 0, GL.GL_RED, width, height, depth, 0, GL.GL_RED, GL.GL_UNSIGNED_BYTE,
-                            None)
+            GL.glTexImage3D(GL.GL_TEXTURE_3D, 0, GL.GL_RED, *self.block_shape, 0, GL.GL_RED, GL.GL_UNSIGNED_BYTE, None)
+
+            GL.glBindTexture(GL.GL_TEXTURE_3D, GL.GL_FALSE)
+            GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_FALSE)
+
         except error.Error as gl_error:
+            GL.glDeleteTextures(len(self.texture), self.texture)
+            GL.glDeleteBuffers(len(self.pbo), self.pbo)
             if gl_error.err == 1285:  # out of memory error code
                 raise MemoryError('Out of memory') from gl_error
             raise gl_error
@@ -414,17 +451,26 @@ class Texture3D:
 
     def __del__(self):
         with suppress(error.Error, ctypes.ArgumentError):
-            GL.glDeleteTextures(1, [self.texture])
-            GL.glDeleteBuffers(1, [self.pbo])
+            print('delete buffer')
+            GL.glDeleteTextures(len(self.texture), self.texture)
+            GL.glDeleteBuffers(len(self.pbo), self.pbo)
 
-    def bind(self, texture=GL.GL_TEXTURE0):
+    def bind(self, texture=GL.GL_TEXTURE0, index=0):
         """Binds the texture to given texture unit
 
         :param texture: texture unit
         :type texture: GL.Constant
+        :param index: texture index
+        :type index: int
         """
+        GL.glEnable(GL.GL_TEXTURE_3D)
         GL.glActiveTexture(texture)
-        GL.glBindTexture(GL.GL_TEXTURE_3D, self.texture)
+        GL.glBindTexture(GL.GL_TEXTURE_3D, self.texture[-1])
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self.pbo[index])
+        block = self.blocks[index]
+        tmp = self.data[block.start[0]:block.stop[0], block.start[1]:block.stop[1], block.start[2]:block.stop[2]]
+        GL.glBufferSubData(GL.GL_PIXEL_UNPACK_BUFFER, 0, tmp.nbytes, tmp)
+        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, GL.GL_FALSE)
 
     def release(self):
         """Releases the buffers associated with this object from the current OpenGL context"""

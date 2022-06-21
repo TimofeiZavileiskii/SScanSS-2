@@ -63,6 +63,11 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
         else:
             self.setCursor(QtCore.Qt.ArrowCursor)
 
+    def createRenderBuffer(self):
+        self.frame_buffer = QtGui.QOpenGLFramebufferObject(self.width(), self.height(),
+                                                           QtGui.QOpenGLFramebufferObject.CombinedDepthStencil,
+                                                           GL.GL_TEXTURE_2D)
+
     def initializeGL(self):
         try:
             GL.glClearColor(*Colour.white())
@@ -71,6 +76,8 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glDisable(GL.GL_CULL_FACE)
             GL.glEnable(GL.GL_MULTISAMPLE)
+
+            self.createRenderBuffer()
 
             number_of_lights = self.initLights()
             # Create and compile GLSL shaders program
@@ -137,6 +144,7 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
         return len(directions)
 
     def resizeGL(self, width, height):
+        self.createRenderBuffer()
         GL.glViewport(0, 0, width, height)
         GL.glMatrixMode(GL.GL_PROJECTION)
         self.scene.camera.aspect = width / height
@@ -163,9 +171,19 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
 
         GL.glMatrixMode(GL.GL_MODELVIEW)
         GL.glLoadTransposeMatrixf(self.scene.camera.model_view)
+        GL.glFlush()
+        self.ttemp()
+        self.temp()
 
+    def ttemp(self):
+        self.frame_buffer.bindDefault()
+        GL.glClearColor(*Colour.white())
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         if self.show_coordinate_frame:
             self.renderAxis()
+        #self.makeCurrent()
+
+    def temp(self):
 
         for node in self.scene.nodes:
             self.recursiveDraw(node)
@@ -253,46 +271,57 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
         :param node: node
         :type node: VolumeRenderNode
         """
+        # self.frame_buffer.bind()
+        # GL.glViewport(0, 0, self.width(), self.height())
+        # GL.glClearColor(0, 0, 0, 0)
+        # GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+
         program = self.shader_programs['volume']
         program.bind()
         node.buffer.bind()
-        node.volume.bind(GL.GL_TEXTURE0)
         node.transfer_function.bind(GL.GL_TEXTURE1)
+        GL.glActiveTexture(GL.GL_TEXTURE2)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.frame_buffer.texture())
+        for i, block in enumerate(node.blocks):
+            node.volume.bind(GL.GL_TEXTURE0, i)
+            tmp = Matrix44.fromTranslation(block.origin)
+            align_transform = node.transform @ tmp
+            GL.glPushMatrix()
+            GL.glMultTransposeMatrixf(tmp @ block.scale)
 
-        GL.glPushMatrix()
-        GL.glMultTransposeMatrixf(node.scale_matrix)
+            view_matrix = np.array(self.scene.camera.model_view @ align_transform, np.float32)
+            focal_length = 1 / np.tan(np.pi / 180 * self.scene.camera.fov / 2)
+            inverse_view_proj = np.linalg.inv(self.scene.camera.projection @ view_matrix)
 
-        align_transform = node.transform
-        view_matrix = np.array(self.scene.camera.model_view @ align_transform, np.float32)
-        focal_length = 1 / np.tan(np.pi / 180 * self.scene.camera.fov / 2)
-        inverse_view_proj = np.linalg.inv(self.scene.camera.projection @ view_matrix)
+            program.setUniform('view', view_matrix, transpose=True)
+            program.setUniform('inverse_view_proj', inverse_view_proj, transpose=True)
+            program.setUniform('aspect_ratio', self.scene.camera.aspect)
+            program.setUniform('focal_length', focal_length)
+            program.setUniform('viewport_size', [self.width(), self.height()])
+            program.setUniform('top', block.top)
+            program.setUniform('bottom', block.bottom)
+            program.setUniform('step_length', 0.001)
+            program.setUniform('gamma', 2.2)
+            program.setUniform('volume', 0)
+            program.setUniform('transfer_func', 1)
+            program.setUniform('render_texture', 2)
+            program.setUniform('highlight', node.selected or node.outlined)
+            program.setUniform('clip_top', True if i == 0 else False)
 
-        program.setUniform('view', view_matrix, transpose=True)
-        program.setUniform('inverse_view_proj', inverse_view_proj, transpose=True)
-        program.setUniform('aspect_ratio', self.scene.camera.aspect)
-        program.setUniform('focal_length', focal_length)
-        program.setUniform('viewport_size', [self.width(), self.height()])
-        program.setUniform('top', node.top)
-        program.setUniform('bottom', node.bottom)
-        program.setUniform('step_length', 0.001)
-        program.setUniform('gamma', 2.2)
-        program.setUniform('volume', 0)
-        program.setUniform('transfer_func', 1)
-        program.setUniform('highlight', node.selected or node.outlined)
+            if node.selected:
+                GL.glColor4f(*settings.value(settings.Key.Selected_Colour))
 
-        if node.selected:
-            GL.glColor4f(*settings.value(settings.Key.Selected_Colour))
+            if node.outlined:
+                GL.glColor4f(1, 0, 0, 1)
 
-        if node.outlined:
-            GL.glColor4f(1, 0, 0, 1)
+            node.buffer.bind()
+            GL.glDrawElements(GL.GL_TRIANGLES, node.buffer.count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+            GL.glPopMatrix()
 
-        node.buffer.bind()
-        GL.glDrawElements(GL.GL_TRIANGLES, node.buffer.count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
         node.volume.release()
         node.transfer_function.release()
         node.buffer.release()
         program.release()
-        GL.glPopMatrix()
 
     def drawNode(self, node, primitive):
         """Renders a leaf node (node with no child) from the scene
@@ -593,41 +622,41 @@ class OpenGLRenderer(QtWidgets.QOpenGLWidget):
         GL.glDisable(GL.GL_DEPTH_CLAMP)
         GL.glDepthFunc(GL.GL_LESS)
 
-        origin, ok = self.project(0., 0., 0.)
-        if not ok:
-            return
+        # origin, ok = self.project(0., 0., 0.)
+        # if not ok:
+        #     return
 
         # It is needed to push individual attributes because of issue detailed in
         # https://stackoverflow.com/questions/8504947/glpopattrib-gl-invalid-operation
         # The issue leads to crash on some intel GPUs
-        GL.glPushAttrib(GL.GL_DEPTH_BUFFER_BIT)
-        GL.glPushAttrib(GL.GL_ENABLE_BIT)
-        painter = QtGui.QPainter(self)
-        painter.setPen(QtGui.QColor.fromRgbF(0.5, 0.5, 0.5))
-        painter.setFont(self.default_font)
-
-        # draw origin
-        painter.drawEllipse(QtCore.QPointF(origin.x, origin.y), 10, 10)
-
-        axes = [(1, 0, 0, 'X'), (0, 1, 0, 'Y'), (0, 0, 1, 'Z')]
-
-        for x, y, z, label in axes:
-            painter.setPen(QtGui.QColor.fromRgbF(x, y, z))
-
-            x *= scale * 1.01
-            y *= scale * 1.01
-            z *= scale * 1.01
-
-            text_pos, ok = self.project(x, y, z)
-            if not ok:
-                continue
-
-            # Render text
-            painter.drawText(QtCore.QPointF(*text_pos[:2]), label)
-
-        painter.end()
-        GL.glPopAttrib()
-        GL.glPopAttrib()
+        # GL.glPushAttrib(GL.GL_DEPTH_BUFFER_BIT)
+        # GL.glPushAttrib(GL.GL_ENABLE_BIT)
+        # painter = QtGui.QPainter(self)
+        # painter.setPen(QtGui.QColor.fromRgbF(0.5, 0.5, 0.5))
+        # painter.setFont(self.default_font)
+        #
+        # # draw origin
+        # painter.drawEllipse(QtCore.QPointF(origin.x, origin.y), 10, 10)
+        #
+        # axes = [(1, 0, 0, 'X'), (0, 1, 0, 'Y'), (0, 0, 1, 'Z')]
+        #
+        # for x, y, z, label in axes:
+        #     painter.setPen(QtGui.QColor.fromRgbF(x, y, z))
+        #
+        #     x *= scale * 1.01
+        #     y *= scale * 1.01
+        #     z *= scale * 1.01
+        #
+        #     text_pos, ok = self.project(x, y, z)
+        #     if not ok:
+        #         continue
+        #
+        #     # Render text
+        #     painter.drawText(QtCore.QPointF(*text_pos[:2]), label)
+        #
+        # painter.end()
+        # GL.glPopAttrib()
+        # GL.glPopAttrib()
 
     def viewFrom(self, direction):
         """Changes view direction of scene camera

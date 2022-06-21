@@ -288,6 +288,30 @@ class InstanceRenderNode(Node):
         self.outlined = [False] * len(self.per_object_transform)
 
 
+class Block:
+    """Creates block object for volume rendering.
+
+    :param start:
+    :type start:
+    :param stop:
+    :type stop:
+    :param origin:
+    :type origin:
+    :param voxel_size:
+    :type voxel_size:
+    """
+    def __init__(self, start, stop, origin, voxel_size):
+
+        self.start = start
+        self.stop = stop
+        self.origin = origin
+        self.shape = tuple([stop[i] - start[i] for i in range(3)])
+        extent = voxel_size * self.shape
+        self.top = extent / 2
+        self.bottom = -extent / 2
+        self.scale = np.diag([*(0.5 * extent), 1])
+
+
 class VolumeRenderNode(Node):
     """Creates Node object for volume rendering.
 
@@ -298,8 +322,25 @@ class VolumeRenderNode(Node):
         super().__init__()
 
         self.render_primitive = Node.RenderPrimitive.Volume
+        self.blocks = []
+        for i in range(2):
+            width, height, depth = volume.data.shape
+            overlap = 5
 
-        self.volume = Texture3D(volume.data)
+            half_size = depth / 2
+            block_size = depth // 2 + overlap
+            start = [0, 0, 0]
+            stop = [width, height, 0]
+            origin = np.array([0., 0., 0.])
+            if i == 0:
+                stop[2] = block_size
+            else:
+                start[2] = depth - block_size
+                stop[2] = depth
+            origin[2] = (start[2] + (stop[2] - start[2]) / 2) - half_size
+            self.blocks.append(Block(tuple(start), tuple(stop), origin, volume.voxel_size))
+
+        self.volume = Texture3D(volume.data, self.blocks)
         self.transfer_function = Texture1D(volume.curve.transfer_function)
 
         volume_mesh = create_cuboid(2, 2, 2)
